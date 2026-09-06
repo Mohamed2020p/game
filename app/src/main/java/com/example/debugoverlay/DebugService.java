@@ -40,6 +40,7 @@ import java.nio.charset.StandardCharsets;
  *       touch on it is forwarded to the native ImGui renderer
  *   [3] settings persistence: native UI changes arrive via
  *       onNativeSettingChanged(...) and are serialized to settings.json
+ *   [4] auto-scans for the game process (io.supercent.bulldozermasters)
  *
  * Everything the panel draws is produced by libnative-lib.so rendering into
  * the SurfaceView's Surface through EGL + OpenGL ES 3.
@@ -66,6 +67,11 @@ public class DebugService extends Service {
     private final JSONObject settingsState = new JSONObject();
     private final Runnable saveRunnable = this::saveSettingsNow;
 
+    // ---- Game status ----
+    private boolean gameFound = false;
+    private int gamePid = 0;
+    private long il2cppBase = 0;
+
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
@@ -80,7 +86,6 @@ public class DebugService extends Service {
         goForeground();
 
         if (!Settings.canDrawOverlays(this)) {
-            // MainActivity enforces this too; belt and suspenders.
             Log.w(TAG, "overlay permission missing — stopping");
             stopSelf();
             return;
@@ -92,8 +97,12 @@ public class DebugService extends Service {
         NativeBridge.setCallbackTarget(this);
         NativeBridge.setDensity(density);
         loadSettings();
-        NativeBridge.startDemoGame();
+
+        // ---- Start the scanner (targets the REAL game) ----
+        NativeBridge.startScanner();
+
         showFloatingButton();
+        Log.i(TAG, "DebugService started, scanning for io.supercent.bulldozermasters");
     }
 
     @Override
@@ -112,10 +121,11 @@ public class DebugService extends Service {
             button = null;
         }
         NativeBridge.clearSurface();
-        NativeBridge.stopDemoGame();
+        NativeBridge.stopScanner();
         main.removeCallbacks(saveRunnable);
         saveSettingsNow();
         isRunning = false;
+        Log.i(TAG, "DebugService destroyed");
         super.onDestroy();
     }
 
@@ -129,23 +139,21 @@ public class DebugService extends Service {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel ch = new NotificationChannel(CHANNEL_ID,
-                    "Debug overlay demo", NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription("Keeps the educational overlay alive");
+                    "Debug overlay", NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription("Keeps the BulldozerMaster debug overlay alive");
             nm.createNotificationChannel(ch);
         }
         Notification.Builder b = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
         Notification notif = b
-                .setContentTitle("Debug overlay demo")
-                .setContentText("Educational self-introspection overlay is active")
+                .setContentTitle("Debug overlay — BulldozerMaster")
+                .setContentText("Educational debug overlay is active")
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)
                 .setOngoing(true)
                 .build();
 
         if (Build.VERSION.SDK_INT >= 34) {
-            // API 34 demands a foregroundServiceType; specialUse is declared
-            // in the manifest together with its subtype property.
             startForeground(NOTIFICATION_ID, notif,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         } else {
@@ -158,8 +166,8 @@ public class DebugService extends Service {
     // -------------------------------------------------------------------------
 
     private void showFloatingButton() {
-        final int sizePx = (int) (30 * density);   // "30px" at mdpi; dp keeps it
-                                                   // usable across densities
+        final int sizePx = (int) (30 * density);
+
         button = new PickaxeView(this);
 
         buttonParams = new WindowManager.LayoutParams(
@@ -208,7 +216,6 @@ public class DebugService extends Service {
         wm.addView(button, buttonParams);
     }
 
-    /** TYPE_APPLICATION_OVERLAY (26+) or the legacy TYPE_PHONE on API 24/25. */
     private int overlayWindowType() {
         return Build.VERSION.SDK_INT >= 26
                 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -224,7 +231,6 @@ public class DebugService extends Service {
             return wm.getCurrentWindowMetrics().getBounds().width();
         }
         android.graphics.Point p = new android.graphics.Point();
-        //noinspection deprecation — the legacy path exists for API 24-29
         wm.getDefaultDisplay().getRealSize(p);
         return p.x;
     }
@@ -234,14 +240,12 @@ public class DebugService extends Service {
             return wm.getCurrentWindowMetrics().getBounds().height();
         }
         android.graphics.Point p = new android.graphics.Point();
-        //noinspection deprecation
         wm.getDefaultDisplay().getRealSize(p);
         return p.y;
     }
 
     /**
-     * The pickaxe icon, drawn with Canvas primitives — no image assets needed
-     * and the geometry doubles as a tiny 2D-graphics lesson.
+     * The pickaxe icon, drawn with Canvas primitives — no image assets needed.
      */
     private static final class PickaxeView extends View {
         private final Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -290,8 +294,6 @@ public class DebugService extends Service {
     private void addPanel() {
         if (panel != null) return;
         panel = new SurfaceView(this);
-        // TRANSLUCENT + an EGL config chosen with ALPHA_SIZE=8 gives the panel
-        // its see-through "glass" background.
         panel.getHolder().setFormat(PixelFormat.TRANSLUCENT);
 
         SurfaceHolder holder = panel.getHolder();
@@ -316,8 +318,6 @@ public class DebugService extends Service {
                 PixelFormat.TRANSLUCENT);
 
         try {
-            // While the panel is open it receives touches (that's how ImGui
-            // gets input). Re-add the button afterwards so it stays on top.
             if (button != null && button.getParent() instanceof WindowManager) {
                 wm.removeView(button);
             }
@@ -331,7 +331,6 @@ public class DebugService extends Service {
         } catch (WindowManager.BadTokenException e) {
             Log.e(TAG, "failed to show panel", e);
             panel = null;
-            // Never leave the user without the floating button.
             if (button != null && button.getParent() == null) {
                 try { wm.addView(button, buttonParams); } catch (Exception ignored) { }
             }
@@ -349,11 +348,11 @@ public class DebugService extends Service {
     }
 
     // -------------------------------------------------------------------------
-    // [3] Settings persistence (org.json -> filesDir/settings.json)
+    // [3] Native callbacks (called from native-lib.cpp)
     // -------------------------------------------------------------------------
 
     /** Called from NATIVE threads whenever the ImGui UI changes a setting. */
-    @SuppressWarnings("unused")   // resolved reflectively by native code
+    @SuppressWarnings("unused")
     public void onNativeSettingChanged(String key, boolean isFloat, float value) {
         main.post(() -> {
             try {
@@ -362,8 +361,6 @@ public class DebugService extends Service {
             } catch (JSONException e) {
                 Log.e(TAG, "bad setting key " + key, e);
             }
-            // Debounce: sliders fire many events per drag; write at most
-            // every 400 ms of quiet.
             main.removeCallbacks(saveRunnable);
             main.postDelayed(saveRunnable, 400);
         });
@@ -374,6 +371,22 @@ public class DebugService extends Service {
     public void onOverlayPanelClosed() {
         main.post(this::removePanel);
     }
+
+    /** Called from native thread when the game is found. */
+    @SuppressWarnings("unused")
+    public void onGameFound() {
+        main.post(() -> {
+            gameFound = true;
+            gamePid = NativeBridge.getGamePid();
+            il2cppBase = NativeBridge.getIl2CppBase();
+            Log.i(TAG, "Game found! PID=" + gamePid + ", il2cpp=0x" + Long.toHexString(il2cppBase));
+            // Update UI? The overlay will show it.
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // [3] Settings persistence (org.json -> filesDir/settings.json)
+    // -------------------------------------------------------------------------
 
     private void loadSettings() {
         File f = new File(getFilesDir(), SETTINGS_FILE);
@@ -410,7 +423,6 @@ public class DebugService extends Service {
                 out.write(settingsState.toString().getBytes(StandardCharsets.UTF_8));
                 out.getFD().sync();
             }
-            // Atomic swap so a crash mid-write never corrupts the file.
             if (!tmp.renameTo(dst)) Log.w(TAG, "settings rename failed");
         } catch (IOException e) {
             Log.e(TAG, "could not save settings", e);

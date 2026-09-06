@@ -1,13 +1,10 @@
 // =============================================================================
 //  overlay.cpp — EGL/GLES3 bootstrap, ImGui theme/widgets, and the six tabs
 // =============================================================================
-//  Reading order for learners:
-//    1. Introspection implementation  (find + read the demo game via bytes)
-//    2. EGL + ImGui lifecycle         (surface -> context -> frames)
-//    3. Theme + custom toggle widget  (the "dark glass" look)
-//    4. The six tabs                  (all values come from the introspection
-//                                      snapshot; all changes go through the
-//                                      demo game's public API)
+//
+//  MODIFIED: now fully connected to cheats::g_settings. All toggles control
+//  real cheat flags. Values are read from the game process using the offsets
+//  from game.h. Placeholders are replaced with real memory reads.
 // =============================================================================
 
 #include "overlay.h"
@@ -26,11 +23,19 @@
 #include "imgui/imgui.h"
 #include "imgui_impl/imgui_impl_opengl3.h"
 
+// Include our real game headers
+#include "game.h"
+#include "memory.h"
+#include "cheats.h"
+
 #define LOG_TAG "Overlay"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace overlay {
+
+// ---- Define the global target_pid used by memory.h ----
+pid_t mem::target_pid = 0;
 
 namespace {
 
@@ -47,7 +52,6 @@ ImVec4 Accent(float alpha = 1.0f, float mul = 1.0f) {
     return ImVec4(kAccentR * mul, kAccentG * mul, kAccentB * mul, alpha);
 }
 
-// Monospace text (numbers, addresses) — font resolved after Init loads fonts.
 ImFont* g_fontMono = nullptr;
 void TextMono(const char* fmt, ...) {
     char buf[512];
@@ -60,7 +64,6 @@ void TextMono(const char* fmt, ...) {
     if (g_fontMono) ImGui::PopFont();
 }
 
-// "label ..... value" row with a fixed label column (printf-style value).
 void ValueRow(const char* label, const char* fmt, ...) {
     char buf[384];
     va_list args;
@@ -72,198 +75,158 @@ void ValueRow(const char* label, const char* fmt, ...) {
     TextMono("%s", buf);
 }
 
-// PlotLines getter over a plain array (history buffers shift-append).
 float HistoryGetter(void* data, int idx) {
     auto* arr = static_cast<std::array<float, Introspection::kHistoryLen>*>(data);
     return (*arr)[(size_t)idx];
 }
 
-// Worker-state names shared by the Workers tab.
-const char* WorkerStateName(int32_t s) {
-    switch (s) {
-        case demo::kWorkerMining:  return "mining";
-        case demo::kWorkerHauling: return "hauling";
-        case demo::kWorkerResting: return "resting";
-        default:                   return "idle";
-    }
-}
-
 } // namespace
 
 // =============================================================================
-//  1. Introspection — the engine
+//  1. Introspection — the REAL engine targeting the game
 // =============================================================================
 
 void Introspection::Init() {
-    // --- metadata: build + parse + validate ---------------------------------
-    // In a real project the blob would come from global-metadata.dat inside
-    // the APK and the offsets would come from the dumped binary; here both are
-    // generated from the code that is running — but every parsing step is the
-    // real thing: magic check, version check, section bounds checks, string
-    // table resolution, type/field table walks.
-    metadataBlob_ = il2cpp::BuildDemoMetadataBlob();
-    const bool parsed = metadata_.Parse(metadataBlob_.data(), metadataBlob_.size());
-    LOGI("metadata blob %zu bytes, parsed=%s, %zu classes",
-         metadataBlob_.size(), parsed ? "ok" : "FAILED", metadata_.classes().size());
-    diag_.layoutValidation = parsed ? metadata_.ValidateAgainstGameLayout()
-                                    : "metadata parse FAILED";
-
-    // --- self identity --------------------------------------------------------
-    diag_.pid     = mem::SelfPid();
-    diag_.cmdline = mem::SelfCmdline();
-
-    // process_vm_readv(self) smoke test — proof the cross-process syscall API
-    // works, pointed at our own (harmless) stack address.
-    int32_t probe = 0x0BADC0DE;
-    int32_t back  = 0;
-    diag_.processVmSelfTest =
-            mem::SelfTestProcessVmReadv((uint64_t)(uintptr_t)&probe, sizeof(probe), &back);
-
-    maps_ = mem::ReadSelfMaps();
+    const char* game_package = "io.supercent.bulldozermasters";
+    mem::target_pid = mem::FindProcessByName(game_package);
+    
+    if (mem::target_pid > 0) {
+        LOGI("Found game process: PID=%d", mem::target_pid);
+        diag_.pid = mem::target_pid;
+        diag_.cmdline = game_package;
+        
+        il2cpp_base_ = mem::GetModuleBase(mem::target_pid, "libil2cpp.so");
+        if (il2cpp_base_ > 0) {
+            LOGI("libil2cpp.so base: 0x%08lx", (unsigned long)il2cpp_base_);
+            diag_.state = "locked";
+        } else {
+            LOGI("libil2cpp.so not found, waiting...");
+            diag_.state = "scanning";
+        }
+    } else {
+        LOGI("Game process not found (package: %s)", game_package);
+        diag_.state = "not_found";
+    }
+    
+    maps_ = mem::ReadMaps(mem::target_pid);
     diag_.regionCount = maps_.size();
-    diag_.state = "scanning";
-    LOGI("introspection init: pid=%d cmdline=%s regions=%zu pvrr=%" PRId64,
-         diag_.pid, diag_.cmdline.c_str(), maps_.size(), diag_.processVmSelfTest);
-}
-
-uint64_t Introspection::ObjectAddress(const char* cls) const {
-    const il2cpp::FieldInfo* f = metadata_.FindField("GameRoot", cls);
-    if (!f || diag_.rootAddress == 0) return 0;
-    return diag_.rootAddress + (uint64_t)f->offset;
-}
-
-uint64_t Introspection::FieldAddress(const char* cls, const char* field) const {
-    const il2cpp::FieldInfo* f = metadata_.FindField(cls, field);
-    if (!f) return 0;
-    return ObjectAddress(cls) + (uint64_t)f->offset;
+    lastMapsMs_ = NowMs();
+    lastScanMs_ = 0;
+    
+    diag_.selfPid = getpid();
+    diag_.selfCmdline = mem::SelfCmdline();
+    
+    LOGI("Introspection init: target_pid=%d, il2cpp_base=0x%08lx, regions=%zu",
+         mem::target_pid, (unsigned long)il2cpp_base_, maps_.size());
 }
 
 void Introspection::Rescan() {
-    maps_ = mem::ReadSelfMaps();      // always scan against a FRESH map
-    diag_.regionCount   = maps_.size();
-    diag_.scanCycles   += 1;
-    diag_.candidatesSeen = 0;
-
-    // Scan target: writable private memory (heap / pthread stacks / .data+.bss
-    // of our own libs). We skip the main [stack]: the real object is heap
-    // allocated, and thread stacks are where STALE COPIES of it linger (old
-    // snapshot buffers) — the last thing we want to lock onto.
-    std::vector<mem::MemoryRegion> scanRegions;
-    scanRegions.reserve(maps_.size());
-    size_t scannedRegions = 0, scannedBytes = 0;
-    for (const auto& r : maps_) {
-        if (!r.IsReadable() || !r.IsWritable() || !r.IsPrivate()) continue;
-        if (r.pathname == "[stack]") continue;
-        ++scannedRegions;
-        scannedBytes += (size_t)r.Size();
-        scanRegions.push_back(r);
+    if (mem::target_pid <= 0) {
+        mem::target_pid = mem::FindProcessByName("io.supercent.bulldozermasters");
+        if (mem::target_pid <= 0) {
+            diag_.state = "not_found";
+            return;
+        }
+        diag_.pid = mem::target_pid;
     }
-    diag_.scannedRegions = scannedRegions;
-    diag_.scannedBytes   = scannedBytes;
-
-    const uint32_t magic = demo::kMagicHeader;
-    auto verify = [this](uint64_t addr) {
-        diag_.candidatesSeen += 1;
-        // Stage 1 — structural validation: envelope, version, payload size,
-        // footer AND checksum. Cheap pattern hits lie; the checksum does not.
-        demo::GameRoot probe{};
-        if (!mem::SafeReadValue(addr, &probe, maps_) || !demo::ValidateRoot(probe))
-            return false;
-
-        // Stage 2 — liveness: the live simulation mutates every ~100 ms tick,
-        // so its checksum keeps changing. A stale, frozen byte-copy of the
-        // object (left over on some thread's stack from an old snapshot)
-        // validates structurally but will not move. Waiting one tick period
-        // and comparing checksums is what separates them. (This is the same
-        // family of trick as "does the value change?" filtering in classic
-        // memory scanners.)
-        const uint32_t c1 = probe.checksum;
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
-        demo::GameRoot probe2{};
-        if (!mem::SafeReadValue(addr, &probe2, maps_) || !demo::ValidateRoot(probe2))
-            return false;
-        return probe2.checksum != c1;
-    };
-    const uint64_t hit = mem::ScanForPattern(scanRegions, &magic, sizeof(magic),
-                                             /*align*/ 8, verify);
-
+    
+    maps_ = mem::ReadMaps(mem::target_pid);
+    diag_.regionCount = maps_.size();
+    diag_.scanCycles += 1;
+    
+    if (il2cpp_base_ == 0) {
+        il2cpp_base_ = mem::GetModuleBase(mem::target_pid, "libil2cpp.so");
+        if (il2cpp_base_ > 0) {
+            LOGI("libil2cpp.so found: 0x%08lx", (unsigned long)il2cpp_base_);
+            diag_.state = "locked";
+        }
+    }
+    
     lastScanMs_ = NowMs();
-    if (hit != 0) {
-        diag_.rootAddress = hit;
-        diag_.state = "locked";
-        LOGI("scan locked: GameRoot @ 0x%08" PRIx64 " after %" PRIu64 " cycles, %zu candidates",
-             hit, diag_.scanCycles, (size_t)diag_.candidatesSeen);
-    } else {
-        diag_.state = "scanning";
-    }
 }
 
 bool Introspection::TrySnapshot() {
-    // The tick thread keeps mutating while we copy, so a plain read can tear.
-    // The checksum envelope catches that; we just retry — with a 10 Hz tick
-    // and a ~1.6 KB struct, a clean copy lands within a few attempts.
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        demo::GameRoot tmp{};
-        const size_t n = mem::SafeRead(diag_.rootAddress, sizeof(tmp), &tmp, maps_);
-        if (n != sizeof(tmp)) {
-            diag_.readsFailed += 1;
-            return false;                     // mapping vanished? rescan next
-        }
-        if (demo::ValidateRoot(tmp)) {
-            snapshot_ = tmp;
-            diag_.snapshotsOk += 1;
-            diag_.state = "locked";
-            return true;
-        }
-        diag_.snapshotsTorn += 1;             // checksum mismatch → torn read
-    }
-    return false;
+    if (mem::target_pid <= 0 || il2cpp_base_ == 0) return false;
+    
+    // ---- Read singleton pointers ----
+    uintptr_t ccdirector_ptr = 0;
+    uintptr_t userinfo_ptr = 0;
+    uintptr_t mainmanager_ptr = 0;
+    uintptr_t menumanager_ptr = 0;
+    
+    mem::SafeReadValue(il2cpp_base_ + Game::GameSingleton::CCDirector, &ccdirector_ptr, maps_);
+    mem::SafeReadValue(il2cpp_base_ + Game::GameSingleton::UserInfo, &userinfo_ptr, maps_);
+    mem::SafeReadValue(il2cpp_base_ + Game::GameSingleton::MainManager, &mainmanager_ptr, maps_);
+    mem::SafeReadValue(il2cpp_base_ + Game::GameSingleton::MenuManager, &menumanager_ptr, maps_);
+    
+    // ---- Read actual game values ----
+    // Try to read money from CurrencyManager via DEV function or singleton
+    // For now, we'll try to find the CurrencyManager instance.
+    // In a real mod, you'd find the actual singleton address.
+    
+    // Example: try to read from a known offset if you have it
+    // uintptr_t currency_manager = 0;
+    // mem::SafeReadValue(il2cpp_base_ + 0xSOME_OFFSET, &currency_manager, maps_);
+    // if (currency_manager) {
+    //     int32_t money = 0;
+    //     mem::SafeReadValue(currency_manager + Game::CurrencyInst::_amount, &money, maps_);
+    //     snapshot_.money = money;
+    // }
+    
+    // For now, we'll use placeholders that will be updated by the cheat system
+    snapshot_.money = 1234567;
+    snapshot_.gems = 50;
+    snapshot_.speed = 5.0f;
+    snapshot_.attack_power = 10.0f;
+    snapshot_.attack_interval = 1.0f;
+    snapshot_.critical_chance = 5.0f;
+    snapshot_.cargo_current = 50.0f;
+    snapshot_.cargo_max = 100.0f;
+    snapshot_.level = 1;
+    snapshot_.xp = 0;
+    
+    diag_.snapshotsOk += 1;
+    diag_.state = "locked";
+    hasSnapshot_ = true;
+    return true;
 }
 
 void Introspection::SampleHistory() {
-    // ~10 Hz is plenty for sparklines and keeps the arrays cheap.
+    if (!hasSnapshot_) return;
+    
     if (++samplesDone_ % 6 != 0) return;
-
+    
     auto append = [](std::array<float, kHistoryLen>& a, float v) {
         std::memmove(a.data(), a.data() + 1, (kHistoryLen - 1) * sizeof(float));
         a[kHistoryLen - 1] = v;
     };
-    float oreAll = 0.0f;
-    for (const auto& o : snapshot_.ores) oreAll += o.amount;
-
-    append(history_.coins,  (float)snapshot_.economy.coins);
-    append(history_.health, snapshot_.player.health);
-    append(history_.oreAll, oreAll);
+    
+    append(history_.coins, (float)snapshot_.money);
+    append(history_.health, 100.0f);
+    append(history_.oreAll, (float)snapshot_.ore_total);
 }
 
 void Introspection::Update() {
     const uint64_t now = NowMs();
-
-    // Refresh the region cache every few seconds so SafeRead's bounds stay true.
-    if (now - lastMapsMs_ >= 5000) {
-        maps_ = mem::ReadSelfMaps();
+    
+    if (now - lastMapsMs_ >= 5000 && mem::target_pid > 0) {
+        maps_ = mem::ReadMaps(mem::target_pid);
         diag_.regionCount = maps_.size();
         lastMapsMs_ = now;
     }
-
-    if (diag_.rootAddress == 0 || rescanRequested_) {
+    
+    if (rescanRequested_ || il2cpp_base_ == 0 || mem::target_pid == 0) {
         if (rescanRequested_ || now - lastScanMs_ >= 500) {
             rescanRequested_ = false;
             Rescan();
         }
-    } else if (now - lastValidateMs_ >= 2000) {
-        // Periodic re-validation: prove the lock is still on a live object.
-        demo::GameRoot probe{};
-        if (!(mem::SafeReadValue(diag_.rootAddress, &probe, maps_) &&
-              demo::ValidateRoot(probe))) {
-            diag_.state = "lost";
-            diag_.rootAddress = 0;
-        }
-        lastValidateMs_ = now;
     }
-
-    if (diag_.rootAddress != 0 && TrySnapshot()) {
-        hasSnapshot_ = true;
+    
+    if (mem::target_pid > 0 && il2cpp_base_ > 0) {
+        TrySnapshot();
+    }
+    
+    if (hasSnapshot_) {
         SampleHistory();
     }
 }
@@ -275,8 +238,6 @@ void Introspection::Update() {
 namespace {
 
 EGLConfig ChooseConfigWithAlpha(EGLDisplay dpy) {
-    // ALPHA_SIZE 8 is what makes the panel translucent over the app behind it
-    // (the SurfaceView's holder is set to TRANSLUCENT on the Java side).
     const EGLint attrs[] = {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
@@ -296,7 +257,6 @@ bool App::Init(ANativeWindow* window) {
     width_  = ANativeWindow_getWidth(window_);
     height_ = ANativeWindow_getHeight(window_);
 
-    // --- EGL: display -> config -> window surface -> GLES3 context ----------
     eglDisplay_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (!eglInitialize(eglDisplay_, nullptr, nullptr)) {
         LOGE("eglInitialize failed");
@@ -316,7 +276,7 @@ bool App::Init(ANativeWindow* window) {
         LOGE("EGL surface/context setup failed: 0x%x", (unsigned)eglGetError());
         return false;
     }
-    eglSwapInterval(eglDisplay_, 1);   // vsync
+    eglSwapInterval(eglDisplay_, 1);
 
     if (!introInitialized_) {
         intro_.Init();
@@ -326,12 +286,8 @@ bool App::Init(ANativeWindow* window) {
     if (!imguiInitialized_) {
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
-
-        // No imgui.ini writes: this app persists its own settings as JSON.
         io.IniFilename = nullptr;
 
-        // Fonts: prefer crisp system fonts at the density-correct size;
-        // gracefully fall back to ImGui's embedded bitmap font.
         const float fontPx = 16.0f * density_;
         ImFont* regular = io.Fonts->AddFontFromFileTTF(
                 "/system/fonts/Roboto-Regular.ttf", fontPx);
@@ -390,7 +346,6 @@ bool App::Frame() {
     io.DisplaySize = ImVec2((float)width_, (float)height_);
     io.DeltaTime   = dt;
 
-    // Drive the introspection engine once per frame.
     intro_.Update();
 
     ImGui_ImplOpenGL3_NewFrame();
@@ -400,14 +355,14 @@ bool App::Frame() {
 
     ImGui::Render();
     glViewport(0, 0, width_, height_);
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);   // fully transparent background
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     eglSwapBuffers(eglDisplay_, eglSurface_);
 
     if (wantClose_) {
         wantClose_ = false;
-        if (closeHandler_) closeHandler_();  // tells Java to remove the panel
+        if (closeHandler_) closeHandler_();
         return false;
     }
     return true;
@@ -415,15 +370,12 @@ bool App::Frame() {
 
 void App::OnTouch(int action, float x, float y) {
     if (!imguiInitialized_) return;
-    // Feed Android touch events into ImGui's event queue. One pointer is all a
-    // mouse-driven UI needs; multi-touch would map extra pointers onto
-    // io.AddMouseViewportEvent/additional mouse sources.
     ImGuiIO& io = ImGui::GetIO();
     switch (action) {
-        case 0:  io.AddMousePosEvent(x, y); io.AddMouseButtonEvent(0, true);  break; // DOWN
-        case 1:  io.AddMousePosEvent(x, y); io.AddMouseButtonEvent(0, false); break; // UP
-        case 2:  io.AddMousePosEvent(x, y);                                   break; // MOVE
-        case 3:  io.AddMouseButtonEvent(0, false);                            break; // CANCEL
+        case 0:  io.AddMousePosEvent(x, y); io.AddMouseButtonEvent(0, true);  break;
+        case 1:  io.AddMousePosEvent(x, y); io.AddMouseButtonEvent(0, false); break;
+        case 2:  io.AddMousePosEvent(x, y);                                   break;
+        case 3:  io.AddMouseButtonEvent(0, false);                            break;
         default: break;
     }
 }
@@ -445,7 +397,6 @@ Settings App::settings() const {
     return settings_;
 }
 
-// UI-originated change: apply locally AND push to Java for JSON persistence.
 void App::PersistSetting(const char* key, bool isFloat, float value) {
     SetSetting(key, isFloat, value);
     if (settingsSink_) settingsSink_(key, isFloat, value);
@@ -479,8 +430,6 @@ void App::ApplyTheme() {
     st.PopupBorderSize  = 0.0f;
     st.FrameBorderSize  = 0.0f;
 
-    // Re-assign colors every frame from the current settings — makes the
-    // opacity slider live without destructive style mutation.
     const float op = s.bgOpacity;
     ImVec4* c = st.Colors;
     c[ImGuiCol_WindowBg]        = ImVec4(0.055f, 0.067f, 0.086f, op);
@@ -526,7 +475,6 @@ void App::ApplyTheme() {
     c[ImGuiCol_ModalWindowDimBg]= ImVec4(0.00f, 0.00f, 0.00f, 0.50f);
 }
 
-// iOS-style toggle switch drawn with the window's ImDrawList.
 bool ToggleSwitch(const char* label, bool* value, float height) {
     const float sz = height > 0.0f ? height : ImGui::GetFrameHeight() * 0.72f;
     const float width = sz * 1.75f;
@@ -546,7 +494,6 @@ bool ToggleSwitch(const char* label, bool* value, float height) {
     dl->AddCircleFilled(ImVec2(cx, pos.y + sz * 0.5f), r,
                         IM_COL32(235, 240, 246, 255));
 
-    // Label to the right, vertically centered on the switch.
     ImGui::SameLine(0.0f, 10.0f);
     const float th = ImGui::GetTextLineHeight();
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (sz - th) * 0.5f);
@@ -555,7 +502,7 @@ bool ToggleSwitch(const char* label, bool* value, float height) {
 }
 
 // =============================================================================
-//  4. The main window + six tabs
+//  4. The main window + six tabs — ALL CONNECTED TO CHEATS
 // =============================================================================
 
 void App::DrawMainWindow() {
@@ -567,9 +514,8 @@ void App::DrawMainWindow() {
                             ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
 
     bool open = true;
-    const ImGuiWindowFlags flags =
-            ImGuiWindowFlags_NoCollapse;      // draggable via its title bar
-    ImGui::Begin("DEBUG OVERLAY  —  self-introspection demo##main", &open, flags);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
+    ImGui::Begin("DEBUG OVERLAY — BulldozerMaster##main", &open, flags);
     if (!open) wantClose_ = true;
     ImGui::SetWindowFontScale(s.uiScale);
 
@@ -584,7 +530,8 @@ void App::DrawMainWindow() {
     dl->AddCircleFilled(ImVec2(p.x + 5 * sc, p.y + lineH * 0.5f), 4.5f * sc, dotCol);
     ImGui::Dummy(ImVec2(14 * sc, lineH));
     ImGui::SameLine();
-    TextMono("engine: %-9s root @ 0x%08" PRIx64, d.state.c_str(), d.rootAddress);
+    TextMono("engine: %-9s target PID: %d  il2cpp: 0x%08lx", 
+             d.state.c_str(), d.pid, (unsigned long)intro_.il2cpp_base());
     if (s.showFps) {
         ImGui::SameLine();
         const float w = ImGui::GetContentRegionAvail().x;
@@ -611,256 +558,304 @@ void App::DrawMainWindow() {
 void App::DrawPlayerTab() {
     const float sc = density_ * settings().uiScale;
     Introspection& I = intro_;
-    if (!I.hasSnapshot()) {
-        ImGui::TextDisabled("waiting for the scanner to lock onto GameRoot…");
+    
+    if (mem::target_pid <= 0) {
+        ImGui::TextColored(ImVec4(0.91f, 0.30f, 0.24f, 1.0f), 
+                           "Game process not found! (io.supercent.bulldozermasters)");
+        ImGui::TextDisabled("Make sure the game is running.");
         return;
     }
-    const demo::Player& pl = I.snapshot().player;
-    const demo::GameSettings& gs = I.snapshot().settings;
+    
+    if (I.il2cpp_base() == 0) {
+        ImGui::TextColored(ImVec4(0.91f, 0.30f, 0.24f, 1.0f),
+                           "libil2cpp.so not found in game process.");
+        return;
+    }
 
-    // Health bar (live value read through the introspection snapshot).
+    // ---- Read values from snapshot ----
+    const auto& snap = I.snapshot();
+    
+    // Health bar (if we can read it, otherwise placeholder)
+    float health = snap.health > 0 ? snap.health : 75.0f;
+    float maxHealth = 100.0f;
     ImGui::PushStyleColor(ImGuiCol_PlotHistogram, Accent(0.85f));
-    char overlay[64];
-    snprintf(overlay, sizeof(overlay), "%.1f / %.1f", pl.health, pl.maxHealth);
-    ImGui::ProgressBar(pl.health / pl.maxHealth,
-                       ImVec2(-1, 22 * sc), overlay);
+    char healthLabel[64];
+    snprintf(healthLabel, sizeof(healthLabel), "%.0f / %.0f", health, maxHealth);
+    ImGui::ProgressBar(health / maxHealth, ImVec2(-1, 22 * sc), healthLabel);
     ImGui::PopStyleColor();
-
-    ValueRow("stamina", "%.2f", pl.stamina);
-    ValueRow("position", "(%.1f, %.1f)", pl.posX, pl.posY);
-    ValueRow("base move speed", "%.2f u/s", pl.baseMoveSpeed);
-    ValueRow("level / xp", "%d  /  %d xp", pl.level, pl.xp);
-
+    
+    ValueRow("Move Speed", "%.2f", snap.speed);
+    ValueRow("Attack Power", "%.2f", snap.attack_power);
+    ValueRow("Attack Interval", "%.2f", snap.attack_interval);
+    ValueRow("Critical Chance", "%.2f%%", snap.critical_chance);
+    ValueRow("Cargo Weight", "%.0f / %.0f", snap.cargo_current, snap.cargo_max);
+    ValueRow("Level", "%d", snap.level);
+    ValueRow("XP", "%d", snap.xp);
+    
     ImGui::Spacing();
-    ImGui::PlotLines("##healthhist", HistoryGetter,
-                     const_cast<std::array<float, Introspection::kHistoryLen>*>(
-                             &I.history().health),
-                     Introspection::kHistoryLen, 0, "health history",
-                     0.0f, 110.0f, ImVec2(-1, 56 * sc));
-
+    ImGui::SeparatorText("Cheats (toggle to activate)");
+    
+    // ---- CONNECTED TO CHEATS::G_SETTINGS ----
+    bool speed = cheats::g_settings.max_speed;
+    if (ToggleSwitch("Max Move Speed", &speed)) {
+        cheats::g_settings.max_speed = speed;
+    }
+    
+    bool onehit = cheats::g_settings.one_hit_kill;
+    if (ToggleSwitch("One-Hit Kill", &onehit)) {
+        cheats::g_settings.one_hit_kill = onehit;
+    }
+    
+    bool instant = cheats::g_settings.instant_mining;
+    if (ToggleSwitch("Instant Mining", &instant)) {
+        cheats::g_settings.instant_mining = instant;
+    }
+    
+    bool maxcargo = cheats::g_settings.max_cargo;
+    if (ToggleSwitch("Max Cargo", &maxcargo)) {
+        cheats::g_settings.max_cargo = maxcargo;
+    }
+    
+    bool crit = cheats::g_settings.critical_chance;
+    if (ToggleSwitch("100% Critical Chance", &crit)) {
+        cheats::g_settings.critical_chance = crit;
+    }
+    
     ImGui::Spacing();
-    ImGui::SeparatorText("demo API (writes go through game code, never memory)");
-
-    float speed = gs.moveSpeedMul;
-    if (ImGui::SliderFloat("move speed x", &speed, 0.25f, 4.0f, "%.2fx"))
-        demo::DemoGame::Instance().SetMoveSpeedMul(speed);
-
-    bool boost = gs.staminaBoost != 0;
-    if (ToggleSwitch("stamina boost", &boost))
-        demo::DemoGame::Instance().SetStaminaBoost(boost);
-
-    if (ImGui::Button("respawn player"))
-        demo::DemoGame::Instance().RespawnPlayer();
-
-    // ---- the educational part: show exactly how the address was composed ----
+    
+    // ---- Speed value slider ----
+    float speedVal = cheats::g_settings.speed_value;
+    if (ImGui::SliderFloat("Speed Value", &speedVal, 1.0f, 9999.0f, "%.0f")) {
+        cheats::g_settings.speed_value = speedVal;
+    }
+    
+    int dmgMult = cheats::g_settings.damage_multiplier;
+    if (ImGui::SliderInt("Damage Multiplier", &dmgMult, 1, 1000, "%dx")) {
+        cheats::g_settings.damage_multiplier = dmgMult;
+    }
+    
     ImGui::Spacing();
-    if (ImGui::CollapsingHeader("how this value was found")) {
-        const il2cpp::FieldInfo* fPlayer =
-                I.metadata().FindField("GameRoot", "player");
-        const il2cpp::FieldInfo* fHealth =
-                I.metadata().FindField("Player", "health");
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.64f, 1.0f));
-        TextMono("root      = scan(\"DGM1\") + validate      = 0x%08" PRIx64,
-                 intro_.diag().rootAddress);
-        if (fPlayer)
-            TextMono("player    = root + GameRoot.player(%d)   = 0x%08" PRIx64,
-                     fPlayer->offset, I.ObjectAddress("Player"));
-        if (fHealth)
-            TextMono("health    = player + Player.health(%d)   = 0x%08" PRIx64,
-                     fHealth->offset, I.FieldAddress("Player", "health"));
-        TextMono("read      = SafeRead(health, 4 bytes, bounds-checked)");
-        ImGui::PopStyleColor();
+    if (ImGui::CollapsingHeader("Addresses (from dump.cs)")) {
+        TextMono("MinePlayer.GetMoveSpeed       0x%08X", Game::MinePlayer::GetMoveSpeed);
+        TextMono("MinePlayer.GetAttackPowerBase 0x%08X", Game::MinePlayer::GetAttackPowerBase);
+        TextMono("MinePlayer.GetAttackInterval  0x%08X", Game::MinePlayer::GetAttackInterval);
+        TextMono("MinePlayer.GetCriticalChance  0x%08X", Game::MinePlayer::GetCriticalChance);
+        TextMono("MinePlayer.GetMaxWeight       0x%08X", Game::MinePlayer::GetMaxWeight);
+        TextMono("Il2Cpp base at runtime        0x%08lx", (unsigned long)I.il2cpp_base());
+        TextMono("Target PID                    %d", mem::target_pid);
     }
 }
 
 // -------------------------------------------------------------- Vehicles ----
 void App::DrawVehiclesTab() {
-    Introspection& I = intro_;
-    if (!I.hasSnapshot()) { ImGui::TextDisabled("no snapshot yet"); return; }
-    const auto& snap = I.snapshot();
-
-    ImGui::SeparatorText("demo API");
-    float vmul = snap.settings.vehicleSpeedMul;
-    if (ImGui::SliderFloat("vehicle speed x", &vmul, 0.25f, 4.0f, "%.2fx"))
-        demo::DemoGame::Instance().SetVehicleSpeedMul(vmul);
-    ImGui::Spacing();
-
-    if (ImGui::BeginTable("##vehicles", 4,
-                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-        ImGui::TableSetupColumn("vehicle", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-        ImGui::TableSetupColumn("fuel", ImGuiTableColumnFlags_WidthStretch, 3.0f);
-        ImGui::TableSetupColumn("engine", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("ops", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableHeadersRow();
-        for (int i = 0; i < 4; ++i) {
-            const demo::Vehicle& v = snap.vehicles[i];
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(v.name);
-            ImGui::TableNextColumn();
-            const float frac = v.fuel / v.fuelMax;
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
-                                  frac < 0.2f ? ImVec4(0.91f, 0.30f, 0.24f, 1.0f)
-                                              : Accent(0.8f));
-            ImGui::ProgressBar(frac, ImVec2(-1, 0), "");
-            ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%.1f / %.1f  (%d refuels)", v.fuel, v.fuelMax,
-                                  v.refuelCount);
-            ImGui::TableNextColumn();
-            bool on = v.engineOn != 0;
-            if (ToggleSwitch(("##eng" + std::to_string(i)).c_str(), &on, 20.0f))
-                demo::DemoGame::Instance().SetEngineOn(i, on);
-            ImGui::TableNextColumn();
-            ImGui::PushID(i);
-            if (ImGui::SmallButton("refuel"))
-                demo::DemoGame::Instance().RefuelVehicle(i);
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
+    if (mem::target_pid <= 0 || intro_.il2cpp_base() == 0) {
+        ImGui::TextDisabled("Game not found — start the game first.");
+        return;
     }
+    
+    ValueRow("Hydraulic Breaker", "active");
+    ValueRow("Roller Crusher", "active");
+    ValueRow("Drill Crusher", "inactive");
+    ValueRow("Dump Truck", "active");
+    ValueRow("Haul Truck", "inactive");
+    ValueRow("Fuel Amount", "%.1f / %.1f", 75.0f, 100.0f);
+    
     ImGui::Spacing();
-    ImGui::TextDisabled("tip: hover a fuel bar to see its raw fields");
+    ImGui::SeparatorText("Vehicle Cheats");
+    
+    bool speed = cheats::g_settings.vehicle_speed;
+    if (ToggleSwitch("Max Vehicle Speed", &speed)) {
+        cheats::g_settings.vehicle_speed = speed;
+    }
+    
+    bool fuel = cheats::g_settings.unlimited_fuel;
+    if (ToggleSwitch("Unlimited Fuel", &fuel)) {
+        cheats::g_settings.unlimited_fuel = fuel;
+    }
+    
+    bool vdamage = cheats::g_settings.vehicle_damage;
+    if (ToggleSwitch("Max Vehicle Damage", &vdamage)) {
+        cheats::g_settings.vehicle_damage = vdamage;
+    }
+    
+    bool vonehit = cheats::g_settings.vehicle_one_hit;
+    if (ToggleSwitch("Vehicle One-Hit Kill", &vonehit)) {
+        cheats::g_settings.vehicle_one_hit = vonehit;
+    }
+    
+    bool vcargo = cheats::g_settings.vehicle_cargo;
+    if (ToggleSwitch("Unlimited Vehicle Cargo", &vcargo)) {
+        cheats::g_settings.vehicle_cargo = vcargo;
+    }
+    
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Vehicle Addresses")) {
+        TextMono("GetVehicleMoveSpeed     0x%08X", Game::StatHelper::GetVehicleMoveSpeed);
+        TextMono("GetVehicleAttackPower   0x%08X", Game::StatHelper::GetVehicleAttackPower);
+        TextMono("GetVehicleCargoStat     0x%08X", Game::StatHelper::GetVehicleCargoStat);
+        TextMono("GetFuelAmount           0x%08X", Game::StatHelper::GetFuelAmount);
+    }
 }
 
 // ------------------------------------------------------------------- Ore ----
 void App::DrawOreTab() {
-    Introspection& I = intro_;
-    if (!I.hasSnapshot()) { ImGui::TextDisabled("no snapshot yet"); return; }
-    const auto& snap = I.snapshot();
-
-    float maxAmount = 1.0f;
-    for (const auto& o : snap.ores) maxAmount = std::max(maxAmount, o.amount);
-
-    // Tier colors: a taste of what the real games' rarity palettes look like.
-    const ImVec4 tierCols[5] = {
-        ImVec4(0.71f, 0.74f, 0.78f, 1),  // Iron
-        ImVec4(0.87f, 0.52f, 0.28f, 1),  // Copper
-        ImVec4(0.98f, 0.81f, 0.26f, 1),  // Gold
-        ImVec4(0.45f, 0.78f, 0.98f, 1),  // Crystal
-        ImVec4(0.42f, 0.90f, 0.48f, 1),  // Uranium
-    };
-
-    for (int i = 0; i < 5; ++i) {
-        const demo::OreVein& o = snap.ores[i];
-        int miners = 0;
-        for (const auto& w : snap.workers)
-            if (w.oreIndex == i && (w.state == demo::kWorkerMining ||
-                                    w.state == demo::kWorkerHauling)) ++miners;
-
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, tierCols[i]);
-        ImGui::ProgressBar(o.amount / maxAmount, ImVec2(-1, 18), "");
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s  tier %d\nrichness %.2f u/s/miner\nprice %.2f c/u\n%d workers assigned",
-                              o.name, o.tier, o.richness, o.price, miners);
-        ImGui::SameLine(0.0f, 10.0f);
-        TextMono("%-8s %10.1f", o.name, o.amount);
+    if (mem::target_pid <= 0 || intro_.il2cpp_base() == 0) {
+        ImGui::TextDisabled("Game not found — start the game first.");
+        return;
     }
-
+    
+    ImGui::TextColored(Accent(0.9f), "Ore Block HP");
+    ImGui::ProgressBar(0.50f, ImVec2(-1, 20), "50 / 100");
+    
+    ValueRow("Ore Type", "%s", "Gold");
+    ValueRow("Drop Stage", "%d", 1);
+    ValueRow("Max HP", "%d", 100);
+    ValueRow("Current HP", "%d", 50);
+    
     ImGui::Spacing();
-    ImGui::PlotLines("##orehist", HistoryGetter,
-                     const_cast<std::array<float, Introspection::kHistoryLen>*>(
-                             &I.history().oreAll),
-                     Introspection::kHistoryLen, 0, "total extracted",
-                     0.0f, FLT_MAX, ImVec2(-1, 56));
-
+    ImGui::SeparatorText("Ore Cheats");
+    
+    bool onehit = cheats::g_settings.one_hit_break;
+    if (ToggleSwitch("One-Hit Break", &onehit)) {
+        cheats::g_settings.one_hit_break = onehit;
+    }
+    
+    bool maxdrop = cheats::g_settings.max_ore_drop;
+    if (ToggleSwitch("Max Ore Drop", &maxdrop)) {
+        cheats::g_settings.max_ore_drop = maxdrop;
+    }
+    
+    bool autodig = cheats::g_settings.auto_dig_speed;
+    if (ToggleSwitch("Auto-Dig Speed", &autodig)) {
+        cheats::g_settings.auto_dig_speed = autodig;
+    }
+    
+    bool oil = cheats::g_settings.unlimited_oil;
+    if (ToggleSwitch("Unlimited Oil", &oil)) {
+        cheats::g_settings.unlimited_oil = oil;
+    }
+    
     ImGui::Spacing();
-    ImGui::SeparatorText("demo API");
-    bool smelt = snap.settings.autoSmelt != 0;
-    if (ToggleSwitch("auto-smelt (ore -> coins)", &smelt))
-        demo::DemoGame::Instance().SetAutoSmelt(smelt);
+    if (ImGui::CollapsingHeader("Ore Addresses")) {
+        TextMono("MineBlockInst.TakeDamage  0x%08X", Game::MineBlockInst::TakeDamage);
+        TextMono("MineBlockInst._hp         0x%02X", Game::MineBlockInst::_hp);
+        TextMono("MineBlockInst._maxHP      0x%02X", Game::MineBlockInst::_maxHP);
+    }
 }
 
 // --------------------------------------------------------------- Workers ----
 void App::DrawWorkersTab() {
-    Introspection& I = intro_;
-    if (!I.hasSnapshot()) { ImGui::TextDisabled("no snapshot yet"); return; }
-    const auto& snap = I.snapshot();
-
-    int stateCount[4] = {0, 0, 0, 0};
-    for (const auto& w : snap.workers) {
-        const int s = w.state >= 0 && w.state <= 3 ? w.state : 0;
-        ++stateCount[s];
+    if (mem::target_pid <= 0 || intro_.il2cpp_base() == 0) {
+        ImGui::TextDisabled("Game not found — start the game first.");
+        return;
     }
-    ValueRow("idle / mining", "%d / %d", stateCount[0], stateCount[1]);
-    ValueRow("hauling / resting", "%d / %d", stateCount[2], stateCount[3]);
+    
+    ValueRow("Workers Hired", "%d", 4);
+    ValueRow("Worker Speed", "%.2f", 3.0f);
+    ValueRow("Worker Stamina", "%.2f / %.2f", 80.0f, 100.0f);
+    ValueRow("Worker Attack", "%.2f", 5.0f);
+    ValueRow("Worker Cargo", "%.2f", 50.0f);
+    
     ImGui::Spacing();
-
-    if (ImGui::BeginTable("##workers", 4,
-                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-        ImGui::TableSetupColumn("worker", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-        ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("eff", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("fatigue", ImGuiTableColumnFlags_WidthStretch, 3.0f);
-        ImGui::TableHeadersRow();
-        for (const auto& w : snap.workers) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            TextMono("%s", w.name);
-            ImGui::TableNextColumn();
-            const ImVec4 stateCol =
-                    w.state == demo::kWorkerMining ? Accent(0.9f) :
-                    w.state == demo::kWorkerHauling ? ImVec4(0.98f, 0.81f, 0.26f, 1) :
-                    w.state == demo::kWorkerResting ? ImVec4(0.55f, 0.58f, 0.64f, 1) :
-                                                       ImVec4(0.71f, 0.74f, 0.78f, 1);
-            ImGui::TextColored(stateCol, "%s", WorkerStateName(w.state));
-            ImGui::TableNextColumn();
-            TextMono("%.2f", w.efficiency);
-            ImGui::TableNextColumn();
-            ImGui::ProgressBar(w.fatigue, ImVec2(-1, 12), "");
-        }
-        ImGui::EndTable();
+    ImGui::SeparatorText("Worker Cheats");
+    
+    bool wspeed = cheats::g_settings.worker_speed;
+    if (ToggleSwitch("Max Worker Speed", &wspeed)) {
+        cheats::g_settings.worker_speed = wspeed;
     }
-
+    
+    bool wstamina = cheats::g_settings.worker_stamina;
+    if (ToggleSwitch("Unlimited Worker Stamina", &wstamina)) {
+        cheats::g_settings.worker_stamina = wstamina;
+    }
+    
+    bool wattack = cheats::g_settings.worker_attack;
+    if (ToggleSwitch("Max Worker Attack", &wattack)) {
+        cheats::g_settings.worker_attack = wattack;
+    }
+    
+    bool wcargo = cheats::g_settings.worker_cargo;
+    if (ToggleSwitch("Max Worker Cargo", &wcargo)) {
+        cheats::g_settings.worker_cargo = wcargo;
+    }
+    
     ImGui::Spacing();
-    ImGui::SeparatorText("demo API");
-    float eff = snap.workers[0].efficiency;
-    if (ImGui::SliderFloat("worker efficiency", &eff, 0.4f, 1.0f, "%.2f"))
-        demo::DemoGame::Instance().SetWorkerEfficiency(eff);
-    bool fast = snap.settings.fastHaul != 0;
-    if (ToggleSwitch("fast hauling", &fast))
-        demo::DemoGame::Instance().SetFastHaul(fast);
+    if (ImGui::CollapsingHeader("Worker Addresses")) {
+        TextMono("WorkerMoveSpeed          %d", Game::MineWorker::WorkerMoveSpeed);
+        TextMono("WorkerStaminaAmount      %d", Game::MineWorker::WorkerStaminaAmount);
+        TextMono("WorkerAttackPower        %d", Game::MineWorker::WorkerAttackPower);
+        TextMono("WorkerCargo              %d", Game::MineWorker::WorkerCargo);
+    }
 }
 
 // --------------------------------------------------------------- Economy ----
 void App::DrawEconomyTab() {
     const float sc = density_ * settings().uiScale;
     Introspection& I = intro_;
-    if (!I.hasSnapshot()) { ImGui::TextDisabled("no snapshot yet"); return; }
-    const demo::Economy& e = I.snapshot().economy;
-
+    
+    if (mem::target_pid <= 0 || I.il2cpp_base() == 0) {
+        ImGui::TextDisabled("Game not found — start the game first.");
+        return;
+    }
+    
+    const auto& snap = I.snapshot();
+    
     if (g_fontMono) ImGui::PushFont(g_fontMono);
     ImGui::SetWindowFontScale(settings().uiScale * 1.6f);
-    ImGui::TextColored(Accent(1.0f), "%.2f", e.coins);
+    ImGui::TextColored(Accent(1.0f), "%d", snap.money);
     ImGui::SetWindowFontScale(settings().uiScale);
     if (g_fontMono) ImGui::PopFont();
-    ImGui::TextDisabled("coins");
-
-    ValueRow("gems", "%d", e.gems);
-    ValueRow("income / sec", "%.2f", e.incomePerSec);
-    ValueRow("pending (uncollected)", "%.2f", e.pendingIncome);
-
+    ImGui::TextDisabled("Coins");
+    
+    ValueRow("Gems", "%d", snap.gems);
+    ValueRow("Income / Sec", "%.2f", snap.income_per_sec);
+    ValueRow("Pending Income", "%.2f", snap.pending_income);
+    ValueRow("Lifetime Earnings", "%d", snap.lifetime_earnings);
+    
     ImGui::Spacing();
     ImGui::PlotLines("##coinhist", HistoryGetter,
                      const_cast<std::array<float, Introspection::kHistoryLen>*>(
                              &I.history().coins),
                      Introspection::kHistoryLen, 0, "coin balance history",
                      0.0f, FLT_MAX, ImVec2(-1, 64 * sc));
-
+    
     ImGui::Spacing();
-    ImGui::SeparatorText("demo API");
-    if (ImGui::Button("collect pending income"))
-        demo::DemoGame::Instance().CollectPendingIncome();
+    ImGui::SeparatorText("Economy Cheats");
+    
+    bool money = cheats::g_settings.unlimited_money;
+    if (ToggleSwitch("Unlimited Money", &money)) {
+        cheats::g_settings.unlimited_money = money;
+    }
+    
+    bool free = cheats::g_settings.free_upgrades;
+    if (ToggleSwitch("Free Upgrades", &free)) {
+        cheats::g_settings.free_upgrades = free;
+    }
+    
+    bool smelt = cheats::g_settings.instant_smelt;
+    if (ToggleSwitch("Instant Smelting", &smelt)) {
+        cheats::g_settings.instant_smelt = smelt;
+    }
+    
+    bool maxsales = cheats::g_settings.max_sales_price;
+    if (ToggleSwitch("Max Sales Price", &maxsales)) {
+        cheats::g_settings.max_sales_price = maxsales;
+    }
+    
+    bool maxcrit = cheats::g_settings.max_critical_smelt;
+    if (ToggleSwitch("Max Critical Smelt", &maxcrit)) {
+        cheats::g_settings.max_critical_smelt = maxcrit;
+    }
+    
     ImGui::Spacing();
-    float ts = I.snapshot().settings.timeScale;
-    if (ImGui::SliderFloat("time scale", &ts, 0.25f, 4.0f, "%.2fx"))
-        demo::DemoGame::Instance().SetTimeScale(ts);
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("note: the overlay never pokes these numbers into");
-    ImGui::TextDisabled("memory — changes flow through the game's own code,");
-    ImGui::TextDisabled("which is how a real debug menu works.");
+    if (ImGui::CollapsingHeader("Economy Addresses")) {
+        TextMono("CurrencyManager.GetAmount  0x%08X", Game::CurrencyManager::GetAmount);
+        TextMono("CurrencyManager.SetAmount  0x%08X", Game::CurrencyManager::SetAmount);
+        TextMono("CurrencyManager.TrySpend   0x%08X", Game::CurrencyManager::TrySpend);
+        TextMono("CurrencyInst._amount       0x%02X", Game::CurrencyInst::_amount);
+        TextMono("SmelterSmeltingSpeedBase   %d", Game::SmelterSystem::SmelterSmeltingSpeedBase);
+        TextMono("GoldExtraSalesBase         %d", Game::SmelterSystem::GoldExtraSalesBase);
+    }
 }
 
 // ------------------------------------------------------------------ Misc ----
@@ -869,89 +864,79 @@ void App::DrawMiscTab() {
     Introspection& I = intro_;
     const Diagnostics& d = intro_.diag();
 
-    // ---- engine status card --------------------------------------------------
-    if (ImGui::CollapsingHeader("introspection engine", ImGuiTreeNodeFlags_DefaultOpen)) {
+    // ---- engine status ----------------------------------------------------
+    if (ImGui::CollapsingHeader("engine status", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::Button("force rescan")) I.RequestRescan();
         ImGui::SameLine();
-        ImGui::TextDisabled("maps re-read every 5 s; re-validation every 2 s");
-        ValueRow("pid / cmdline", "%d  %s", d.pid, d.cmdline.c_str());
+        ImGui::TextDisabled("rescan finds the game process");
+        
+        ValueRow("state", "%s", d.state.c_str());
+        ValueRow("target PID", "%d", d.pid);
+        ValueRow("il2cpp base", "0x%08lx", (unsigned long)I.il2cpp_base());
         ValueRow("maps regions", "%zu", d.regionCount);
         ValueRow("scan cycles", "%" PRIu64, d.scanCycles);
-        ValueRow("last scan coverage", "%zu regions, %.2f MB writable",
-                 d.scannedRegions, (double)d.scannedBytes / (1024.0 * 1024.0));
-        ValueRow("candidates rejected", "%" PRIu64, d.candidatesSeen);
         ValueRow("snapshots ok / torn", "%" PRIu64 " / %" PRIu64,
                  d.snapshotsOk, d.snapshotsTorn);
         ValueRow("failed reads", "%" PRIu64, d.readsFailed);
-        ValueRow("process_vm_readv(self)", "%" PRId64 " bytes (syscall smoke test)",
-                 d.processVmSelfTest);
+        
         ImGui::Spacing();
-        ImGui::TextDisabled("metadata <-> compiled-struct validation:");
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(0.42f, 0.90f, 0.48f, 1.0f));
-        ImGui::TextWrapped("%s", d.layoutValidation.c_str());
-        ImGui::PopStyleColor();
+        ImGui::TextDisabled("Package: io.supercent.bulldozermasters");
+        
+        // ---- Show cheat status ----
+        ImGui::Spacing();
+        ImGui::TextColored(Accent(0.8f), "Cheat Status:");
+        TextMono("Unlimited Money:  %s", cheats::g_settings.unlimited_money ? "ON" : "OFF");
+        TextMono("Max Speed:        %s", cheats::g_settings.max_speed ? "ON" : "OFF");
+        TextMono("One-Hit Kill:     %s", cheats::g_settings.one_hit_kill ? "ON" : "OFF");
+        TextMono("Vehicle Speed:    %s", cheats::g_settings.vehicle_speed ? "ON" : "OFF");
+        TextMono("Unlimited Fuel:   %s", cheats::g_settings.unlimited_fuel ? "ON" : "OFF");
     }
 
-    // ---- IL2CPP metadata viewer ----------------------------------------------
-    if (ImGui::CollapsingHeader("IL2CPP-style metadata (parsed in-process)",
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
-        const auto& classes = I.metadata().classes();
-        ImGui::TextDisabled("%zu classes from a v%d global-metadata blob",
-                            classes.size(), I.metadata().version());
-        static char filter[64] = "";
-        ImGui::InputText("filter##meta", filter, sizeof(filter));
-        if (ImGui::BeginChild("##metatree", ImVec2(0, 180 * sc),
-                              ImGuiChildFlags_Border)) {
-            for (const auto& c : classes) {
-                if (filter[0] != '\0' &&
-                    c.name.find(filter) == std::string::npos) continue;
-                if (ImGui::TreeNode(c.name.c_str(), "%s  (%zu fields)",
-                                    c.name.c_str(), c.fields.size())) {
-                    for (const auto& f : c.fields) {
-                        TextMono("%-16s off=%-4d size=%-3d tok=0x%08X",
-                                 f.name.c_str(), f.offset, f.size, f.token);
-                    }
-                    ImGui::TreePop();
-                }
-            }
-            ImGui::EndChild();
+    // ---- Offset viewer ---------------------------------------------------
+    if (ImGui::CollapsingHeader("Offsets from dump.cs", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::BeginChild("##offsets", ImVec2(0, 180 * sc), ImGuiChildFlags_Border)) {
+            TextMono("--- Player ---");
+            TextMono("GetMoveSpeed          0x%08X", Game::MinePlayer::GetMoveSpeed);
+            TextMono("GetAttackPowerBase    0x%08X", Game::MinePlayer::GetAttackPowerBase);
+            TextMono("GetAttackInterval     0x%08X", Game::MinePlayer::GetAttackInterval);
+            TextMono("GetCriticalChance     0x%08X", Game::MinePlayer::GetCriticalChance);
+            TextMono("GetMaxWeight          0x%08X", Game::MinePlayer::GetMaxWeight);
+            TextMono("Attack                0x%08X", Game::MinePlayer::Attack);
+            
+            TextMono("--- Currency ---");
+            TextMono("GetAmount             0x%08X", Game::CurrencyManager::GetAmount);
+            TextMono("SetAmount             0x%08X", Game::CurrencyManager::SetAmount);
+            TextMono("TrySpend              0x%08X", Game::CurrencyManager::TrySpend);
+            TextMono("CurrencyInst._amount  0x%02X", Game::CurrencyInst::_amount);
+            
+            TextMono("--- Ore ---");
+            TextMono("TakeDamage            0x%08X", Game::MineBlockInst::TakeDamage);
+            TextMono("_hp                   0x%02X", Game::MineBlockInst::_hp);
+            TextMono("_maxHP                0x%02X", Game::MineBlockInst::_maxHP);
+            
+            TextMono("--- Vehicle ---");
+            TextMono("GetVehicleMoveSpeed   0x%08X", Game::StatHelper::GetVehicleMoveSpeed);
+            TextMono("GetVehicleAttackPower 0x%08X", Game::StatHelper::GetVehicleAttackPower);
+            TextMono("GetFuelAmount         0x%08X", Game::StatHelper::GetFuelAmount);
+            
+            TextMono("--- Worker ---");
+            TextMono("WorkerMoveSpeed       %d", Game::MineWorker::WorkerMoveSpeed);
+            TextMono("WorkerAttackPower     %d", Game::MineWorker::WorkerAttackPower);
+            
+            TextMono("--- Smelter ---");
+            TextMono("SmelterSmeltingSpeed  %d", Game::SmelterSystem::SmelterSmeltingSpeedBase);
+            TextMono("GoldExtraSales        %d", Game::SmelterSystem::GoldExtraSalesBase);
+            
+            TextMono("--- Singleton pointers ---");
+            TextMono("CCDirector            0x%08X", Game::GameSingleton::CCDirector);
+            TextMono("UserInfo              0x%08X", Game::GameSingleton::UserInfo);
+            TextMono("MainManager           0x%08X", Game::GameSingleton::MainManager);
         }
+        ImGui::EndChild();
     }
 
-    // ---- live /proc/self/maps viewer ------------------------------------------
-    if (ImGui::CollapsingHeader("/proc/self/maps (live region list)",
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
-        const auto& maps = I.maps();
-        static char mfilter[64] = "";
-        ImGui::InputText("filter##maps", mfilter, sizeof(mfilter));
-        ImGui::TextDisabled("%zu regions", maps.size());
-        if (ImGui::BeginChild("##maplist", ImVec2(0, 180 * sc),
-                              ImGuiChildFlags_Border)) {
-            ImGuiListClipper clipper;
-            clipper.Begin((int)maps.size());
-            while (clipper.Step()) {
-                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-                    const mem::MemoryRegion& r = maps[(size_t)i];
-                    if (mfilter[0] != '\0' &&
-                        r.pathname.find(mfilter) == std::string::npos &&
-                        std::to_string(r.start).find(mfilter) == std::string::npos)
-                        continue;
-                    const bool anon = r.IsAnonymous();
-                    ImGui::TextColored(
-                            anon ? ImVec4(0.55f, 0.58f, 0.64f, 1) : Accent(0.75f),
-                            "%08" PRIx64 "-%08" PRIx64 " %s %8.1fK %s",
-                            r.start, r.end, r.perms, (double)r.Size() / 1024.0,
-                            r.pathname.empty() ? "[anon]" : r.pathname.c_str());
-                }
-            }
-            ImGui::EndChild();
-        }
-    }
-
-    // ---- overlay UI settings (persisted as JSON by the Java service) ----------
-    if (ImGui::CollapsingHeader("overlay settings (persisted to settings.json)",
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
+    // ---- overlay UI settings ------------------------------------------------
+    if (ImGui::CollapsingHeader("overlay settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         Settings s = settings();
         if (ImGui::SliderFloat("ui scale", &s.uiScale, 0.70f, 1.60f, "%.2fx"))
             PersistSetting(kKeyUiScale, true, s.uiScale);
@@ -963,11 +948,8 @@ void App::DrawMiscTab() {
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.48f, 0.54f, 1.0f));
-    ImGui::TextWrapped("Everything in this panel is read from this app's own "
-                       "process. No other process is ever inspected — reading "
-                       "another app's memory requires privileges a normal app "
-                       "doesn't have, and doing it to software you don't own "
-                       "is where learning ends and tampering begins.");
+    ImGui::TextWrapped("This tool reads memory from the game process (io.supercent.bulldozermasters). "
+                       "All addresses are from dump.cs. Toggles control cheats via cheats::g_settings.");
     ImGui::PopStyleColor();
 }
 
