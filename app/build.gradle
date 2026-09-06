@@ -1,0 +1,54 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.debugoverlay'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.debugoverlay"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0-educational"
+
+        externalNativeBuild {
+            cmake {
+                // C++17: structured bindings / std::string_view are handy, and
+                // the NDK r26+ toolchain defaults are fine with this.
+                cppFlags '-std=c++17 -fexceptions -frtti'
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    // The app intentionally uses zero external dependencies (no AndroidX) so
+    // that every moving part is visible framework API - better for learning.
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+// Empty on purpose: everything this app needs is in android.* and the NDK.
+dependencies {
+}

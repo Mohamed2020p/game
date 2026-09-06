@@ -1,0 +1,5 @@
+// Top-level build file. AGP 8.5.x works with Gradle 8.7+ and Android Studio
+// Jellyfish or newer (any Studio that bundles JDK 17).
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}

@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Main launcher screen of the educational demo.
+
+  It does three things:
+    1. Explains what the demo does (and deliberately does NOT do).
+    2. Hosts the "grant overlay permission" and "start / stop service" controls.
+    3. Shows live status so you can see the Android-side plumbing work.
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0B0E13"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <!-- ======================= Header ======================= -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Debug Overlay — Self-Introspection Demo"
+            android:textColor="#00D4FF"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="IL2CPP-style memory introspection, taught end-to-end inside one app"
+            android:textColor="#8A93A3"
+            android:textSize="13sp" />
+
+        <!-- ================= What this demonstrates ================= -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="#14181F"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="What you will learn here"
+                android:textColor="#E6EBF2"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:lineSpacingExtra="3dp"
+                android:text="•  Parsing /proc/self/maps into typed memory regions\n•  Signature scanning: finding an object in the heap from its bytes\n•  An IL2CPP-format metadata parser (sanity, strings, type defs, field offsets)\n•  Bounds-checked, read-only memory access (SafeRead)\n•  ImGui over OpenGL ES 3.0 on an overlay SurfaceView\n•  A 30dp draggable floating button that opens / closes the panel\n•  JSON settings persistence across restarts"
+                android:textColor="#B7C0CE"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!-- ================= Controls ================= -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="#14181F"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Controls"
+                android:textColor="#E6EBF2"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btn_permission"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:backgroundTint="#00D4FF"
+                android:text="Grant overlay permission"
+                android:textColor="#06121A" />
+
+            <Button
+                android:id="@+id/btn_service"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:backgroundTint="#1E2630"
+                android:text="Start demo overlay"
+                android:textColor="#E6EBF2" />
+
+            <TextView
+                android:id="@+id/txt_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:fontFamily="monospace"
+                android:text="status: idle"
+                android:textColor="#8A93A3"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- ================= Scope note ================= -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="24dp"
+            android:background="#14181F"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Scope of this demo"
+                android:textColor="#E6EBF2"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:lineSpacingExtra="3dp"
+                android:text="Everything here introspects this app's OWN process. The demo 'game' is a C++ simulation embedded in the app itself, and the IL2CPP metadata blob is generated in-process. There is no cross-process memory access, no injection, no hooks and no writes — those are not needed to learn the concepts, and using them against software you don't own violates the law in many places as well as every game's terms of service."
+                android:textColor="#B7C0CE"
+                android:textSize="13sp" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>
